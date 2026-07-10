@@ -1,0 +1,224 @@
+version: '3.9'
+
+services:
+  # ========== PostgreSQL Database ==========
+  db:
+    image: postgres:15-alpine
+    container_name: poetry-mr-db
+    environment:
+      POSTGRES_DB: poetry_mr_dev
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_INITDB_ARGS: "-c max_connections=200 -c shared_buffers=256MB"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/docker/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - poetry-mr-net
+
+  # ========== Redis Cache ==========
+  redis:
+    image: redis:7-alpine
+    container_name: poetry-mr-redis
+    command: redis-server --appendonly yes --requirepass ""
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - poetry-mr-net
+
+  # ========== Django Backend ==========
+  web:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: poetry-mr-web
+    command: |
+      sh -c "
+        python manage.py migrate &&
+        python manage.py runserver 0.0.0.0:8000
+      "
+    environment:
+      DEBUG: "True"
+      SECRET_KEY: dev-secret-key-change-me
+      DATABASE_ENGINE: django.db.backends.postgresql
+      DATABASE_NAME: poetry_mr_dev
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_HOST: db
+      DATABASE_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      EMAIL_HOST: mailhog
+      EMAIL_PORT: 1025
+      CORS_ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+    volumes:
+      - ./backend:/app
+      - static_volume:/app/static
+      - media_volume:/app/media
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - poetry-mr-net
+
+  # ========== React Frontend ==========
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: poetry-mr-frontend
+    command: npm run dev
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+      VITE_ENVIRONMENT: development
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - web
+    networks:
+      - poetry-mr-net
+
+  # ========== Celery Worker ==========
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: poetry-mr-celery-worker
+    command: celery -A config worker -l info
+    environment:
+      DEBUG: "False"
+      SECRET_KEY: dev-secret-key-change-me
+      DATABASE_ENGINE: django.db.backends.postgresql
+      DATABASE_NAME: poetry_mr_dev
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_HOST: db
+      DATABASE_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      EMAIL_HOST: mailhog
+      EMAIL_PORT: 1025
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - db
+      - redis
+      - mailhog
+    networks:
+      - poetry-mr-net
+
+  # ========== Celery Beat Scheduler ==========
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: poetry-mr-celery-beat
+    command: celery -A config beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    environment:
+      DEBUG: "False"
+      SECRET_KEY: dev-secret-key-change-me
+      DATABASE_ENGINE: django.db.backends.postgresql
+      DATABASE_NAME: poetry_mr_dev
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_HOST: db
+      DATABASE_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - db
+      - redis
+    networks:
+      - poetry-mr-net
+
+  # ========== Flower (Celery Dashboard) ==========
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: poetry-mr-flower
+    command: celery -A config flower --port=5555
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+      - celery_worker
+    networks:
+      - poetry-mr-net
+
+  # ========== Mailhog (Email Testing) ==========
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: poetry-mr-mailhog
+    ports:
+      - "1025:1025"  # SMTP
+      - "8025:8025"  # Web UI
+    networks:
+      - poetry-mr-net
+
+  # ========== Adminer (Database UI) ==========
+  adminer:
+    image: adminer:latest
+    container_name: poetry-mr-adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+    networks:
+      - poetry-mr-net
+
+  # ========== MinIO (S3-compatible Storage) ==========
+  minio:
+    image: minio/minio:latest
+    container_name: poetry-mr-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: minio server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"  # API
+      - "9001:9001"  # Console
+    networks:
+      - poetry-mr-net
+
+volumes:
+  postgres_data:
+  redis_data:
+  static_volume:
+  media_volume:
+  minio_data:
+
+networks:
+  poetry-mr-net:
+    driver: bridge
